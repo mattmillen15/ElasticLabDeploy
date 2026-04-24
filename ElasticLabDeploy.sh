@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Lab-only bootstrap for a minimal self-managed Elastic Stack + Fleet Server +
+# Lab-only deployment for a minimal self-managed Elastic Stack + Fleet Server +
 # Elastic Defend endpoint policy using the EDRComplete preset (aggressive EDR).
-#
+# LSASS Protected Process / Advanced Credential protection setting off by default. 
+# 
 # Requires: docker, Docker Compose (plugin or standalone), curl, jq, openssl
 # Example:
 #   FLEET_PUBLIC_URL=http://192.168.1.50:8220 \

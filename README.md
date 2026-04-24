@@ -15,7 +15,7 @@ This project is for isolated lab use only.
 ## Quick Start
 
 ```bash
-git clone <YOUR-REPO-URL> ElasticLabDeploy
+git clone https://github.com/mattmillen15/ElasticLabDeploy
 cd ElasticLabDeploy
 sudo ./ElasticLabDeploy.sh
 ```

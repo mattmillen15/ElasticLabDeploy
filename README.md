@@ -8,7 +8,7 @@ ElasticLabDeploy is a deployment tool for standing up Elasticsearch, Kibana, Fle
 - Applies the hardened Elastic Defend policy by default
 - Generates and serves host enrollment files
 - Prints health and policy status
-- Rebuilds or destroys lab state when needed
+- Attempts Elastic Defend trial activation without rebuilding the lab
 
 ## Quick Start
 
@@ -47,11 +47,8 @@ After install:
 - `Health check`
   Shows stack status, Fleet status, policies, enrollment keys, and enrolled agents.
 
-- `Rebuild lab from scratch (retry trial)`
-  Deletes current lab state and redeploys everything from zero.
-
-- `Destroy lab state only`
-  Deletes containers, volumes, and generated runtime files without redeploying.
+- `Refresh Elastic Defend trial`
+  Attempts a new 30-day trial activation through the Elastic license API without rebuilding the lab.
 
 - `Exit`
   Leaves the menu.

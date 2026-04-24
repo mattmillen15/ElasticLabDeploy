@@ -2319,10 +2319,7 @@ if ($InstallSysmon) {
     }
 }
 
-Write-Host 'Elastic Agent installed and service is running.'
-if (Test-Path $agentExe) {
-    & $agentExe status
-}
+Write-Host 'Elastic Agent install completed. Check Fleet or the Elastic Agent service status in a minute.'
 EOFOUT
 }
 
@@ -2812,6 +2809,16 @@ ensure_enrollment_artifacts_for_target() {
 ensure_enrollment_token_available() {
   load_enrollment_env_if_present
   if [[ -n "${ENROLLMENT_TOKEN:-}" ]]; then
+    local endpoint_policy_id
+    endpoint_policy_id="${ENDPOINT_POLICY_ID:-}"
+    if [[ -z "${endpoint_policy_id}" ]]; then
+      load_existing_secrets_if_present
+      resolve_public_urls
+      endpoint_policy_id="$(agent_policy_id_by_name "${ENDPOINT_POLICY_NAME}" || true)"
+    fi
+    if [[ -n "${endpoint_policy_id}" ]]; then
+      refresh_enrollment_outputs "${endpoint_policy_id}" "${ENROLLMENT_TOKEN}"
+    fi
     return 0
   fi
 

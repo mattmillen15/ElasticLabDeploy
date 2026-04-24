@@ -1,8 +1,6 @@
 # ElasticLabDeploy
 
-ElasticLabDeploy is a single-script lab bootstrap tool for standing up Elasticsearch, Kibana, Fleet, Fleet Server, and a hardened Elastic Defend policy with minimal setup.
-
-This project is for isolated lab use only.
+ElasticLabDeploy is a deployment tool for standing up Elasticsearch, Kibana, Fleet, Fleet Server, and a hardened Elastic Defend policy with minimal setup.
 
 ## What It Does
 

@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Lab-only deployment for a minimal self-managed Elastic Stack + Fleet Server +
+# Lab-only bootstrap for a minimal self-managed Elastic Stack + Fleet Server +
 # Elastic Defend endpoint policy using the EDRComplete preset (aggressive EDR).
-# LSASS Protected Process / Advanced Credential protection setting off by default. 
-# 
+#
 # Requires: docker, Docker Compose (plugin or standalone), curl, jq, openssl
 # Example:
 #   FLEET_PUBLIC_URL=http://192.168.1.50:8220 \
@@ -76,7 +75,7 @@ is_root() {
 command_requires_root() {
   local cmd="${1:-menu}"
   case "${cmd}" in
-    bootstrap|fresh-install|install-prereqs|reset|reset-lab|refresh|rebuild-lab|recover-fleet-server|menu)
+    bootstrap|fresh-install|install-prereqs|refresh|refresh-trial|refresh-defend-trial|menu)
       return 0
       ;;
   esac
@@ -2552,6 +2551,36 @@ refresh_lab() {
   rebuild_lab
 }
 
+refresh_defend_trial() {
+  need_cmd curl
+  need_cmd jq
+  load_existing_secrets_if_present
+
+  local before after
+  before="$(current_license_type || true)"
+  log "Current license type before refresh attempt: ${before:-unknown}"
+
+  start_trial_if_possible
+  sleep 1
+
+  after="$(current_license_type || true)"
+  log "Current license type after refresh attempt: ${after:-unknown}"
+
+  cat <<EOFMSG
+
+Trial refresh check complete.
+
+License type before:
+  ${before:-unknown}
+
+License type after:
+  ${after:-unknown}
+
+Kibana:
+  http://$(printf '%s' "${ELASTIC_PUBLIC_URL:-http://127.0.0.1:${ES_PORT}}" | sed -E 's#^http://([^:/]+)(:[0-9]+)?$#\1#'):${KIBANA_PORT}
+EOFMSG
+}
+
 recover_fleet_server() {
   install_host_prereqs
   need_cmd docker
@@ -2921,8 +2950,7 @@ Commands:
   install-prereqs      Install host prerequisites
   enroll-host          Pick a target OS/arch, serve enrollment files, and print the target command
   health-check         Print stack, Fleet, policy, and enrollment status
-  rebuild-lab          Destroy runtime state and redeploy the lab (retries trial activation)
-  reset-lab            Destroy runtime state and containers only
+  refresh-trial        Attempt a new 30-day Elastic Defend trial activation without rebuilding the lab
   help                 Show this message
 EOFMSG
 }
@@ -2934,9 +2962,8 @@ ElasticLabDeploy Menu
   1) Fresh install / repair lab
   2) Enroll a host
   3) Health check
-  4) Rebuild lab from scratch (retry trial)
-  5) Destroy lab state only
-  6) Exit
+  4) Refresh Elastic Defend trial
+  5) Exit
 EOFMSG
     local choice
     read -r -p "Select option: " choice
@@ -2944,12 +2971,8 @@ EOFMSG
       1) bootstrap_lab ;;
       2) enroll_host ;;
       3) health_check ;;
-      4) rebuild_lab ;;
-      5)
-        confirm_destructive_action "destroy the current Elastic lab state"
-        reset_lab
-        ;;
-      6) return 0 ;;
+      4) refresh_defend_trial ;;
+      5) return 0 ;;
       *) echo "Invalid selection" ;;
     esac
     echo
@@ -2965,13 +2988,7 @@ dispatch_command() {
     install-prereqs) install_host_prereqs ;;
     enroll-host|generate-enrollment|serve-enrollment) enroll_host "$@" ;;
     health-check) health_check ;;
-    enforce-defend|enforce-edr-prevent) enforce_defend_policy ;;
-    recover-fleet-server|recover) recover_fleet_server ;;
-    reset|reset-lab)
-      confirm_destructive_action "destroy the current Elastic lab state"
-      reset_lab
-      ;;
-    rebuild-lab|refresh) rebuild_lab ;;
+    refresh-trial|refresh-defend-trial|refresh) refresh_defend_trial ;;
     help|-h|--help) print_usage ;;
     *) die "Unknown command: ${cmd}" ;;
   esac

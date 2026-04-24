@@ -2326,6 +2326,30 @@ if (Test-Path $agentExe) {
 EOFOUT
 }
 
+write_windows_bootstrap_script() {
+  local endpoint_enrollment_token="$1"
+  cat > "${OUTPUT_DIR}/ElasticLabDeploy-Windows.ps1" <<EOFOUT
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = \$true)]
+    [string]\$BaseUrl,
+    [switch]\$ForceReinstall,
+    [switch]\$UninstallOnly
+)
+
+Set-StrictMode -Version Latest
+\$ErrorActionPreference = 'Stop'
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+\$ScriptDir = Join-Path \$env:TEMP 'elastic-enroll'
+\$Installer = Join-Path \$ScriptDir 'Enroll-ElasticAgent.ps1'
+New-Item -ItemType Directory -Path \$ScriptDir -Force | Out-Null
+Invoke-WebRequest "\$BaseUrl/Enroll-ElasticAgent.ps1" -UseBasicParsing -OutFile \$Installer
+
+& \$Installer -FleetUrl '${FLEET_PUBLIC_URL}' -EnrollmentToken '${endpoint_enrollment_token}' -AgentVersion '${STACK_VERSION}' -Insecure:\$true -InstallSysmon:\$true -ForceReinstall:\$ForceReinstall -UninstallOnly:\$UninstallOnly
+EOFOUT
+}
+
 write_outputs() {
   local endpoint_policy_id="$1"
   local endpoint_package_policy_id="$2"
@@ -2352,6 +2376,7 @@ EOFOUT
 
   write_agent_enrollment_examples "${endpoint_enrollment_token}"
   write_windows_enrollment_script
+  write_windows_bootstrap_script "${endpoint_enrollment_token}"
 
   cat > "${OUTPUT_DIR}/Enroll-ElasticAgent-LabDefaults.ps1" <<EOFOUT
 [CmdletBinding()]
@@ -2715,13 +2740,7 @@ detect_iface_ip() {
 print_windows_download_commands() {
   local base_url="$1"
   cat <<EOFOUT
-\$BaseUrl = '${base_url}'
-\$Dst = Join-Path \$env:TEMP 'elastic-enroll'
-New-Item -ItemType Directory -Path \$Dst -Force | Out-Null
-Invoke-WebRequest "\$BaseUrl/Enroll-ElasticAgent.ps1" -OutFile (Join-Path \$Dst 'Enroll-ElasticAgent.ps1')
-Invoke-WebRequest "\$BaseUrl/Enroll-ElasticAgent-LabDefaults.ps1" -OutFile (Join-Path \$Dst 'Enroll-ElasticAgent-LabDefaults.ps1')
-Set-ExecutionPolicy -Scope Process Bypass -Force
-& (Join-Path \$Dst 'Enroll-ElasticAgent-LabDefaults.ps1') -ForceReinstall
+powershell -ep bypass -c "\$p=Join-Path \$env:TEMP 'ElasticLabDeploy-Windows.ps1'; iwr '${base_url}/ElasticLabDeploy-Windows.ps1' -UseBasicParsing -OutFile \$p; & \$p -BaseUrl '${base_url}' -ForceReinstall"
 EOFOUT
 }
 
@@ -2764,7 +2783,7 @@ enrollment_example_filename() {
   local platform="$1"
   local arch="$2"
   case "${platform}:${arch}" in
-    windows:x86_64) printf 'Enroll-ElasticAgent-LabDefaults.ps1\n' ;;
+    windows:x86_64) printf 'ElasticLabDeploy-Windows.ps1\n' ;;
     linux:x86_64) printf 'linux-enroll-example.sh\n' ;;
     linux:arm64) printf 'linux-arm64-enroll-example.sh\n' ;;
     macos:x86_64) printf 'macos-enroll-example.sh\n' ;;
@@ -2780,7 +2799,7 @@ ensure_enrollment_artifacts_for_target() {
   case "${platform}:${arch}" in
     windows:x86_64)
       [[ -f "${OUTPUT_DIR}/Enroll-ElasticAgent.ps1" ]] || die "Missing ${OUTPUT_DIR}/Enroll-ElasticAgent.ps1. Run fresh-install first."
-      [[ -f "${OUTPUT_DIR}/Enroll-ElasticAgent-LabDefaults.ps1" ]] || die "Missing ${OUTPUT_DIR}/Enroll-ElasticAgent-LabDefaults.ps1. Run fresh-install first."
+      [[ -f "${OUTPUT_DIR}/ElasticLabDeploy-Windows.ps1" ]] || die "Missing ${OUTPUT_DIR}/ElasticLabDeploy-Windows.ps1. Run fresh-install first."
       ;;
     *)
       local example_file
@@ -2893,11 +2912,10 @@ enroll_host() {
   arch="${arch:-x86_64}"
   ensure_enrollment_artifacts_for_target "${platform}" "${arch}"
 
-  local base_url bind_ip server_pid example_file
+  local base_url bind_ip server_pid
   base_url="$(resolve_enrollment_base_url)"
   bind_ip="${base_url#http://}"
   bind_ip="${bind_ip%:${ENROLLMENT_HTTP_PORT}}"
-  example_file="$(enrollment_example_filename "${platform}" "${arch}")"
 
   python3 -m http.server "${ENROLLMENT_HTTP_PORT}" --bind "${bind_ip}" --directory "${OUTPUT_DIR}" >/dev/null 2>&1 &
   server_pid=$!
@@ -2906,23 +2924,8 @@ enroll_host() {
 
   trap 'kill "${server_pid}" >/dev/null 2>&1 || true; wait "${server_pid}" 2>/dev/null || true' EXIT
   cat <<EOFMSG
-Target:
-  ${platform}-${arch}
-
-Serving enrollment artifacts from:
-  ${OUTPUT_DIR}
-
-HTTP endpoint:
-  ${base_url}
-
-Primary hosted command for the target:
+Run this on the target:
 $(print_hosted_enrollment_command "${platform}" "${arch}" "${base_url}")
-
-Served file:
-  ${base_url}/${example_file}
-
-Direct enrollment command:
-$(print_agent_enrollment_command "${platform}" "${arch}" "${ENROLLMENT_TOKEN}")
 
 Press ENTER to stop serving enrollment files.
 EOFMSG

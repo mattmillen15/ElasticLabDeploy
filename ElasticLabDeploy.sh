@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Lab-only bootstrap for a minimal self-managed Elastic Stack + Fleet Server +
+# Lab deployment for self-managed Elastic Stack + Fleet Server +
 # Elastic Defend endpoint policy using the EDRComplete preset (aggressive EDR).
 #
 # Requires: docker, Docker Compose (plugin or standalone), curl, jq, openssl

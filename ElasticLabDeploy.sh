@@ -2740,7 +2740,7 @@ detect_iface_ip() {
 print_windows_download_commands() {
   local base_url="$1"
   cat <<EOFOUT
-powershell -ep bypass -c "\$p=Join-Path \$env:TEMP 'ElasticLabDeploy-Windows.ps1'; iwr '${base_url}/ElasticLabDeploy-Windows.ps1' -UseBasicParsing -OutFile \$p; & \$p -BaseUrl '${base_url}' -ForceReinstall"
+iwr '${base_url}/ElasticLabDeploy-Windows.ps1' -UseBasicParsing -OutFile "\$env:TEMP\\ElasticLabDeploy-Windows.ps1"; & "\$env:TEMP\\ElasticLabDeploy-Windows.ps1" -BaseUrl '${base_url}' -ForceReinstall
 EOFOUT
 }
 

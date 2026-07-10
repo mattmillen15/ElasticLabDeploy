@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Lab deployment for self-managed Elastic Stack + Fleet Server +
+# Lab-only bootstrap for a minimal self-managed Elastic Stack + Fleet Server +
 # Elastic Defend endpoint policy using the EDRComplete preset (aggressive EDR).
 #
 # Requires: docker, Docker Compose (plugin or standalone), curl, jq, openssl
@@ -58,6 +58,7 @@ ENROLLMENT_KEY_NAME="${ENROLLMENT_KEY_NAME:-goad-endpoint-enroll}"
 KIBANA_URL="http://127.0.0.1:${KIBANA_PORT}"
 ES_URL_LOCAL="http://127.0.0.1:${ES_PORT}"
 LAST_ENDPOINT_PACKAGE_POLICY_ITEM=""
+TRIAL_ALREADY_ACTIVATED=""
 
 log() {
   printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >&2
@@ -75,7 +76,7 @@ is_root() {
 command_requires_root() {
   local cmd="${1:-menu}"
   case "${cmd}" in
-    bootstrap|fresh-install|install-prereqs|refresh|refresh-trial|refresh-defend-trial|menu)
+    bootstrap|fresh-install|install-prereqs|refresh|refresh-trial|refresh-defend-trial|recover-fleet-server|menu)
       return 0
       ;;
   esac
@@ -750,6 +751,9 @@ start_trial_if_possible() {
   log "Trial license start skipped (HTTP ${http_code:-n/a})"
   if [[ -n "${payload}" ]]; then
     log "License API response: $(jq -c '.' <<<"${payload}" 2>/dev/null || printf '%s' "${payload}")"
+    if jq -e '(.trial_was_started == false) and ((.error_message // "") | test("already activated"; "i"))' >/dev/null 2>&1 <<<"${payload}"; then
+      TRIAL_ALREADY_ACTIVATED="true"
+    fi
   fi
 }
 
@@ -757,27 +761,44 @@ current_license_type() {
   curl -s -u "elastic:${ELASTIC_PASSWORD}" "${ES_URL_LOCAL}/_license" 2>/dev/null | jq -r '.license.type // empty'
 }
 
+current_license_status() {
+  curl -s -u "elastic:${ELASTIC_PASSWORD}" "${ES_URL_LOCAL}/_license" 2>/dev/null | jq -r '.license.status // empty'
+}
+
 ensure_advanced_license() {
-  local license_type
+  local license_type license_status
   license_type="$(current_license_type || true)"
+  license_status="$(current_license_status || true)"
+
   if [[ "${license_type}" == "trial" || "${license_type}" == "platinum" || "${license_type}" == "enterprise" ]]; then
-    log "Advanced protections available under license type '${license_type}'"
-    return 0
+    if [[ "${license_status}" != "expired" && "${license_status}" != "invalid" ]]; then
+      log "Advanced protections available under license type '${license_type}' (status: ${license_status:-active})"
+      return 0
+    fi
+    log "License type '${license_type}' but status is '${license_status:-unknown}'; attempting to start a new trial"
   fi
 
   start_trial_if_possible
   sleep 1
   license_type="$(current_license_type || true)"
+  license_status="$(current_license_status || true)"
+
   if [[ "${license_type}" == "trial" || "${license_type}" == "platinum" || "${license_type}" == "enterprise" ]]; then
-    log "Advanced protections enabled under license type '${license_type}'"
-    return 0
+    if [[ "${license_status}" != "expired" && "${license_status}" != "invalid" ]]; then
+      log "Advanced protections enabled under license type '${license_type}' (status: ${license_status:-active})"
+      return 0
+    fi
   fi
 
   if [[ "${REQUIRE_ADVANCED_PROTECTION}" == "true" ]]; then
-    die "License type '${license_type:-unknown}' does not support full prevention features. Start trial manually or set REQUIRE_ADVANCED_PROTECTION=false."
+    if [[ "${TRIAL_ALREADY_ACTIVATED}" == "true" ]]; then
+      log "Trial was previously activated on this data volume and has expired; a fresh data volume is needed."
+      return 2
+    fi
+    die "License type '${license_type:-unknown}' (status: ${license_status:-unknown}) does not support full prevention features. Start trial manually or set REQUIRE_ADVANCED_PROTECTION=false."
   fi
 
-  log "WARNING: License type '${license_type:-unknown}' limits prevention features (memory/ransomware/behavior/ASR)."
+  log "WARNING: License type '${license_type:-unknown}' (status: ${license_status:-unknown}) limits prevention features (memory/ransomware/behavior/ASR)."
 }
 
 get_latest_package_version() {
@@ -827,6 +848,7 @@ ensure_package_installed() {
   log "Installing/updating Fleet package '${pkg}' (${ver})"
   for query in "${query_variants[@]}"; do
     resp="$(curl -s -u "elastic:${ELASTIC_PASSWORD}" \
+      --connect-timeout 10 --max-time 180 \
       -H 'kbn-xsrf: goad-edr-bootstrap' \
       -H 'Content-Type: application/json' \
       -H 'Accept: application/json' \
@@ -2124,7 +2146,7 @@ function Get-ElasticAgentProductCode {
         Get-ItemProperty -Path $k -ErrorAction SilentlyContinue
     }
 
-    $hit = $items | Where-Object { $_.DisplayName -like 'Elastic Agent*' } | Select-Object -First 1
+    $hit = $items | Where-Object { ($_.PSObject.Properties['DisplayName'] -ne $null) -and ($_.DisplayName -like 'Elastic Agent*') } | Select-Object -First 1
     if (-not $hit) {
         return ''
     }
@@ -2368,7 +2390,7 @@ ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
 ENDPOINT_POLICY_ID=${endpoint_policy_id}
 ENDPOINT_PACKAGE_POLICY_ID=${endpoint_package_policy_id}
 ENDPOINT_PACKAGE_VERSION=${endpoint_pkg_version}
-  ENROLLMENT_TOKEN=${endpoint_enrollment_token}
+ENROLLMENT_TOKEN=${endpoint_enrollment_token}
 EOFOUT
 
   write_agent_enrollment_examples "${endpoint_enrollment_token}"
@@ -2431,6 +2453,33 @@ EOFMSG
   [[ "${ans}" == "YES" ]] || die "Aborted"
 }
 
+_try_unenroll_all_fleet_agents() {
+  if ! curl -fsS -u "elastic:${ELASTIC_PASSWORD}" "${KIBANA_URL}/api/status" >/dev/null 2>&1; then
+    log "Kibana not reachable; skipping pre-wipe agent unenrollment"
+    return 0
+  fi
+  local agent_ids
+  agent_ids="$(curl -s -u "elastic:${ELASTIC_PASSWORD}" \
+    -H 'kbn-xsrf: goad-edr-bootstrap' \
+    "${KIBANA_URL}/api/fleet/agents?perPage=1000" 2>/dev/null \
+    | jq -r '.items[].id' 2>/dev/null || true)"
+  if [[ -z "${agent_ids}" ]]; then
+    log "No enrolled agents to unenroll before wipe"
+    return 0
+  fi
+  log "Unenrolling all Fleet agents before wipe..."
+  local agent_id
+  while IFS= read -r agent_id; do
+    [[ -n "${agent_id}" ]] || continue
+    curl -s -u "elastic:${ELASTIC_PASSWORD}" \
+      -H 'kbn-xsrf: goad-edr-bootstrap' \
+      -H 'Content-Type: application/json' \
+      -X POST "${KIBANA_URL}/api/fleet/agents/${agent_id}/unenroll" \
+      -d '{"force":true,"revoke":true}' >/dev/null 2>&1 || true
+    log "  unenrolled ${agent_id}"
+  done <<< "${agent_ids}"
+}
+
 bootstrap_lab() {
   install_host_prereqs
   need_cmd docker
@@ -2443,13 +2492,30 @@ bootstrap_lab() {
   resolve_public_urls
   load_or_create_secrets
 
+  # Full teardown: unenroll agents, stop fleet server, wipe volumes for a clean rebuild
+  _try_unenroll_all_fleet_agents
+  log "Removing Fleet Server container and state volume"
+  docker rm -f "${FLEET_SERVER_CONTAINER}" >/dev/null 2>&1 || true
+  docker volume rm "${FLEET_SERVER_STATE_VOLUME}" >/dev/null 2>&1 || true
+  if [[ -f "${COMPOSE_FILE}" && -f "${ENV_FILE}" ]]; then
+    log "Stopping stack and wiping data volumes for clean rebuild"
+    compose_cmd down -v 2>/dev/null || true
+  fi
+  TRIAL_ALREADY_ACTIVATED=""
+
   write_compose_files
   compose_up_es
   wait_for_elasticsearch
   set_kibana_system_password
   compose_up_kibana
   wait_for_kibana
-  ensure_advanced_license
+  local adv_rc=0
+  ensure_advanced_license || adv_rc=$?
+  if [[ "${adv_rc}" -eq 2 ]]; then
+    die "A fresh trial could not be started even after wiping the data volume. Check connectivity to the Elastic license service, then retry fresh-install."
+  elif [[ "${adv_rc}" -ne 0 ]]; then
+    return "${adv_rc}"
+  fi
   fleet_api_setup
 
   local fleet_server_pkg_version
@@ -2545,7 +2611,7 @@ enforce_defend_policy() {
   need_cmd curl
   need_cmd jq
   load_existing_secrets_if_present
-  ensure_advanced_license
+  ensure_advanced_license_or_recover
 
   local endpoint_policy_id
   endpoint_policy_id="$(agent_policy_id_by_name "${ENDPOINT_POLICY_NAME}")"
@@ -2573,34 +2639,93 @@ refresh_lab() {
   rebuild_lab
 }
 
+# Print guidance for an expired/already-activated trial. When AUTO_CONFIRM=true,
+# rebuild the lab to obtain a fresh trial and return 0. Otherwise print manual
+# rebuild instructions and return 1, leaving it to the caller to decide whether
+# that is fatal (refresh treats it as informational; policy enforcement dies).
+handle_expired_trial() {
+  cat >&2 <<EOFMSG
+
+NOTE: The Elastic trial cannot be renewed via the API once it has been activated on a cluster.
+To get a fresh 30-day trial the Elasticsearch data volume must be cleared and the lab rebuilt.
+All indexed data will be lost; enrolled agents will need to re-enroll after rebuilding.
+
+EOFMSG
+  if [[ "${AUTO_CONFIRM}" == "true" ]]; then
+    log "AUTO_CONFIRM=true — rebuilding lab to refresh trial"
+    rebuild_lab
+    return 0
+  fi
+  cat >&2 <<EOFMSG
+To rebuild and get a fresh trial:
+  Select option 1 "Fresh install / repair lab" from the menu, or run:
+    ./ElasticLabDeploy.sh fresh-install
+
+EOFMSG
+  return 1
+}
+
+# ensure_advanced_license, but if the trial has expired after already being
+# activated on this cluster (rc==2), drive the rebuild flow instead of letting
+# the bare non-zero return abort the script under set -e.
+ensure_advanced_license_or_recover() {
+  local rc=0
+  ensure_advanced_license || rc=$?
+  if [[ "${rc}" -eq 2 ]]; then
+    handle_expired_trial || die "Trial expired; rebuild required to obtain a fresh trial (re-run after fresh-install)."
+    return 0
+  fi
+  return "${rc}"
+}
+
 refresh_defend_trial() {
   need_cmd curl
   need_cmd jq
   load_existing_secrets_if_present
 
-  local before after
-  before="$(current_license_type || true)"
-  log "Current license type before refresh attempt: ${before:-unknown}"
+  local before_type before_status after_type after_status kibana_host
+  before_type="$(current_license_type || true)"
+  before_status="$(current_license_status || true)"
+  log "License before refresh attempt: type=${before_type:-unknown} status=${before_status:-unknown}"
 
   start_trial_if_possible
-  sleep 1
+  sleep 2
 
-  after="$(current_license_type || true)"
-  log "Current license type after refresh attempt: ${after:-unknown}"
+  after_type="$(current_license_type || true)"
+  after_status="$(current_license_status || true)"
+  log "License after refresh attempt: type=${after_type:-unknown} status=${after_status:-unknown}"
+
+  kibana_host="$(printf '%s' "${ELASTIC_PUBLIC_URL:-http://127.0.0.1:${ES_PORT}}" | sed -E 's#^http://([^:/]+)(:[0-9]+)?$#\1#')"
+
+  if [[ "${after_type}" == "trial" && "${after_status}" == "active" ]]; then
+    cat <<EOFMSG
+
+Trial is active.
+
+License type:   ${after_type}
+License status: ${after_status}
+
+Kibana: http://${kibana_host}:${KIBANA_PORT}
+EOFMSG
+    return 0
+  fi
 
   cat <<EOFMSG
 
 Trial refresh check complete.
 
-License type before:
-  ${before:-unknown}
+License type before:   ${before_type:-unknown}
+License status before: ${before_status:-unknown}
 
-License type after:
-  ${after:-unknown}
+License type after:    ${after_type:-unknown}
+License status after:  ${after_status:-unknown}
 
-Kibana:
-  http://$(printf '%s' "${ELASTIC_PUBLIC_URL:-http://127.0.0.1:${ES_PORT}}" | sed -E 's#^http://([^:/]+)(:[0-9]+)?$#\1#'):${KIBANA_PORT}
+Kibana: http://${kibana_host}:${KIBANA_PORT}
 EOFMSG
+
+  if [[ "${after_status}" == "expired" || "${after_status}" == "invalid" ]]; then
+    handle_expired_trial || true
+  fi
 }
 
 recover_fleet_server() {
@@ -2625,6 +2750,9 @@ recover_fleet_server() {
   fleet_service_token="$(create_fleet_service_token)"
   mkdir -p "${OUTPUT_DIR}"
   write_fleet_server_install_example "${fleet_server_policy_id}" "${fleet_service_token}"
+  log "Removing existing Fleet Server container and state volume for forced re-enrollment"
+  docker rm -f "${FLEET_SERVER_CONTAINER}" >/dev/null 2>&1 || true
+  docker volume rm "${FLEET_SERVER_STATE_VOLUME}" >/dev/null 2>&1 || true
   ensure_fleet_server_runtime "${fleet_server_policy_id}" "${fleet_service_token}"
 }
 
@@ -2648,11 +2776,21 @@ health_check() {
   echo
 
   echo "== Kibana status =="
-  curl -fsS -u "elastic:${ELASTIC_PASSWORD}" "${KIBANA_URL}/api/status" | jq '.status.overall.level'
+  local kib_hc_resp kib_hc_http
+  kib_hc_resp="$(curl -sS -u "elastic:${ELASTIC_PASSWORD}" \
+    -H 'Accept: application/json' \
+    -w '\n%{http_code}' \
+    "${KIBANA_URL}/api/status" 2>/dev/null || true)"
+  kib_hc_http="$(tail -n1 <<<"${kib_hc_resp}")"
+  if [[ "${kib_hc_http}" == "200" ]]; then
+    printf '%s\n' "${kib_hc_resp%$'\n'*}" | jq -r '.status.overall.level // "unknown"' 2>/dev/null || echo "unknown"
+  else
+    echo "unavailable (HTTP ${kib_hc_http:-n/a})"
+  fi
   echo
 
   echo "== Fleet setup =="
-  kibana_get '/api/fleet/agent_policies?perPage=1000' | jq '.items | length'
+  kibana_get '/api/fleet/agent_policies?perPage=1000' | jq '.items | length' || echo "(unavailable)"
   echo
 
   echo "== Fleet Server status =="
@@ -2660,11 +2798,11 @@ health_check() {
   echo
 
   echo "== Agent policies =="
-  kibana_get '/api/fleet/agent_policies?perPage=1000' | jq -r '.items[] | [.id,.name,.has_fleet_server,.is_default_fleet_server] | @tsv'
+  kibana_get '/api/fleet/agent_policies?perPage=1000' | jq -r '.items[] | [.id,.name,.has_fleet_server,.is_default_fleet_server] | @tsv' || echo "(unavailable)"
   echo
 
   echo "== Endpoint package policies =="
-  kibana_get '/api/fleet/package_policies?perPage=1000' | jq -r '.items[] | select(.package.name=="endpoint") | [.id,.name,.policy_id] | @tsv'
+  kibana_get '/api/fleet/package_policies?perPage=1000' | jq -r '.items[] | select(.package.name=="endpoint") | [.id,.name,.policy_id] | @tsv' || echo "(unavailable)"
   echo
 
   echo "== Key integration package policies =="
@@ -2684,7 +2822,7 @@ health_check() {
       )
     | [.package.name,.id,.name,.policy_id,.enabled]
     | @tsv
-  '
+  ' || echo "(unavailable)"
   echo
 
   echo "== Endpoint hardening summary =="
@@ -2720,11 +2858,11 @@ health_check() {
   echo
 
   echo "== Enrollment keys =="
-  kibana_get '/api/fleet/enrollment_api_keys?perPage=1000' | jq -r '.list[] | [.name,.policy_id,.active] | @tsv'
+  kibana_get '/api/fleet/enrollment_api_keys?perPage=1000' | jq -r '.list[] | [.name,.policy_id,.active] | @tsv' || echo "(unavailable)"
   echo
 
   echo "== Enrolled agents =="
-  kibana_get '/api/fleet/agents?perPage=1000' | jq -r '.items[] | [(.local_metadata.host.hostname // "<unknown>"),.policy_id,.last_checkin_status,.active] | @tsv'
+  kibana_get '/api/fleet/agents?perPage=1000' | jq -r '.items[] | [(.local_metadata.host.hostname // "<unknown>"),.policy_id,.last_checkin_status,.active] | @tsv' || echo "(unavailable)"
 }
 
 detect_iface_ip() {
@@ -2955,12 +3093,13 @@ Usage:
 
 Commands:
   menu                 Interactive menu
-  fresh-install        Deploy Elasticsearch, Kibana, Fleet, Fleet Server, and hardened Elastic Defend
+  fresh-install        Deploy Elasticsearch, Kibana, Fleet, Fleet Server, and hardened Elastic Defend (also renews an expired trial)
   bootstrap            Alias for fresh-install
   install-prereqs      Install host prerequisites
   enroll-host          Pick a target OS/arch, serve enrollment files, and print the target command
   health-check         Print stack, Fleet, policy, and enrollment status
-  refresh-trial        Attempt a new 30-day Elastic Defend trial activation without rebuilding the lab
+  refresh-trial        Check the trial; a trial can only be renewed by a full rebuild (fresh-install), which wipes all data
+  recover-fleet-server Re-create the Fleet Server container and re-enroll it against the current cluster
   help                 Show this message
 EOFMSG
 }
@@ -2972,8 +3111,9 @@ ElasticLabDeploy Menu
   1) Fresh install / repair lab
   2) Enroll a host
   3) Health check
-  4) Refresh Elastic Defend trial
-  5) Exit
+  4) Check trial (renewing requires option 1 — wipes data)
+  5) Recover Fleet Server
+  6) Exit
 EOFMSG
     local choice
     read -r -p "Select option: " choice
@@ -2982,7 +3122,8 @@ EOFMSG
       2) enroll_host ;;
       3) health_check ;;
       4) refresh_defend_trial ;;
-      5) return 0 ;;
+      5) recover_fleet_server ;;
+      6) return 0 ;;
       *) echo "Invalid selection" ;;
     esac
     echo
@@ -2999,6 +3140,7 @@ dispatch_command() {
     enroll-host|generate-enrollment|serve-enrollment) enroll_host "$@" ;;
     health-check) health_check ;;
     refresh-trial|refresh-defend-trial|refresh) refresh_defend_trial ;;
+    recover-fleet-server) recover_fleet_server ;;
     help|-h|--help) print_usage ;;
     *) die "Unknown command: ${cmd}" ;;
   esac

@@ -1,0 +1,3 @@
+# Generated lab runtime state — contains live secrets (passwords, enrollment
+# tokens, encryption keys). Never commit.
+runtime/

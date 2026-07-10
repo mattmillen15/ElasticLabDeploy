@@ -1193,7 +1193,13 @@ ensure_threat_intel_integration() {
     fi
 
     attempted_any=1
-    package_version="$(ensure_package_installed "${package_name}")"
+    # Threat intel is best-effort: a candidate that fails to install (e.g. an
+    # unsupported install query param on this Kibana version) must not abort the
+    # deploy via ensure_package_installed's die — fall through to the next candidate.
+    if ! package_version="$(ensure_package_installed "${package_name}")"; then
+      log "Threat intel package '${package_name}' failed to install; trying next candidate if available."
+      continue
+    fi
 
     log "Ensuring threat intel integration (${package_name}) on Fleet Server policy"
     if ensure_generic_integration_on_policy \

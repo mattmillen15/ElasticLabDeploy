@@ -8,7 +8,7 @@ ElasticLabDeploy is a deployment tool for standing up Elasticsearch, Kibana, Fle
 - Applies the hardened Elastic Defend policy by default
 - Generates and serves host enrollment files
 - Prints health and policy status
-- Attempts Elastic Defend trial activation without rebuilding the lab
+- Checks the Elastic Defend trial (renewing an expired trial requires a full rebuild)
 
 ## Quick Start
 
@@ -47,8 +47,11 @@ After install:
 - `Health check`
   Shows stack status, Fleet status, policies, enrollment keys, and enrolled agents.
 
-- `Refresh Elastic Defend trial`
-  Attempts a new 30-day trial activation through the Elastic license API without rebuilding the lab.
+- `Check trial`
+  Reports the Elastic Defend trial type and status. An already-activated trial cannot be renewed in place — getting a fresh 30-day trial requires `Fresh install / repair lab`, which wipes all data and de-enrolls agents.
+
+- `Recover Fleet Server`
+  Re-creates the Fleet Server container and re-enrolls it against the current cluster.
 
 - `Exit`
   Leaves the menu.

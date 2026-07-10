@@ -1108,18 +1108,26 @@ harden_windows_package_policy_streams() {
     die "Failed to harden windows package policy streams"
   fi
 
-  summary="$(fetch_package_policy_item "${package_policy_id}" | jq -c '
-    . as $item
-    | {
-        total_streams: ([ $item.inputs[]?.streams[]? ] | length),
-        enabled_streams: ([ $item.inputs[]?.streams[]? | select(.enabled == true) ] | length),
-        sysmon_enabled: (
-          [ $item.inputs[]?.streams[]? | select(((.id // .data_stream.dataset // "") | ascii_downcase | contains("sysmon")) and .enabled == true) ]
-          | length
-        )
-      }
-  ')"
-  log "Windows integration summary: $(jq -c '.' <<<"${summary}")"
+  # Purely informational summary — never let a post-update fetch failure abort an
+  # otherwise-successful hardening (fetch_package_policy_item can return 1, and
+  # under pipefail that would propagate out of the command substitution).
+  item="$(fetch_package_policy_item "${package_policy_id}" || true)"
+  if [[ -n "${item}" && "${item}" != "null" ]]; then
+    summary="$(jq -c '
+      . as $item
+      | {
+          total_streams: ([ $item.inputs[]?.streams[]? ] | length),
+          enabled_streams: ([ $item.inputs[]?.streams[]? | select(.enabled == true) ] | length),
+          sysmon_enabled: (
+            [ $item.inputs[]?.streams[]? | select(((.id // .data_stream.dataset // "") | ascii_downcase | contains("sysmon")) and .enabled == true) ]
+            | length
+          )
+        }
+    ' <<<"${item}")"
+    log "Windows integration summary: ${summary}"
+  else
+    log "Windows integration summary unavailable (post-update fetch failed)"
+  fi
 }
 
 ensure_osquery_manager_integration() {
@@ -1712,9 +1720,44 @@ install_prebuilt_detection_rules() {
   fi
 
   log "Enabling immutable prebuilt rules (best effort)"
-  if ! kibana_post_checked '/api/detection_engine/rules/_bulk_action' '{"action":"enable","query":"alert.attributes.immutable: true"}' >/dev/null 2>&1; then
-    log "Bulk enable for prebuilt rules did not return success; leaving rule state unchanged."
-  fi
+  # Three 9.x gotchas, all verified live on 9.2.3:
+  #  1. The immutable flag lives under rule params — the KQL field is
+  #     alert.attributes.params.immutable. alert.attributes.immutable does not
+  #     exist in the alert SO index pattern and 400s (matching zero rules).
+  #  2. A query-based _bulk_action resolves the query to ids and 400s when that
+  #     exceeds 1000 (~1890 prebuilt rules exist).
+  #  3. The ids form of _bulk_action caps at 100 ids per call.
+  # Also, _find defaults to sorting by updated_at, so enabling rules while paging
+  # reorders results and skips some. Therefore: phase 1 collects ALL immutable
+  # rule ids without mutating (stable paging), phase 2 enables in chunks of 100
+  # (re-enabling an already-enabled rule is a harmless no-op).
+  local all_ids='[]' page=1 batch bc find_resp
+  while [[ "${page}" -le 60 ]]; do
+    find_resp="$(curl -s -u "elastic:${ELASTIC_PASSWORD}" \
+      -H 'kbn-xsrf: goad-edr-bootstrap' \
+      "${KIBANA_URL}/api/detection_engine/rules/_find?per_page=500&page=${page}&filter=alert.attributes.params.immutable:%20true" 2>/dev/null || true)"
+    batch="$(jq -c '[.data[]?.id]' <<<"${find_resp}" 2>/dev/null || printf '[]')"
+    bc="$(jq 'length' <<<"${batch}" 2>/dev/null || printf '0')"
+    [[ "${bc}" -gt 0 ]] || break
+    all_ids="$(jq -c --argjson acc "${all_ids}" --argjson b "${batch}" -n '$acc + $b')"
+    [[ "${bc}" -lt 500 ]] && break
+    page=$((page + 1))
+  done
+
+  local total offset=0 enabled_total=0 chunk cc
+  total="$(jq 'length' <<<"${all_ids}" 2>/dev/null || printf '0')"
+  while [[ "${offset}" -lt "${total}" ]]; do
+    chunk="$(jq -c --argjson o "${offset}" '.[$o:($o+100)]' <<<"${all_ids}")"
+    cc="$(jq 'length' <<<"${chunk}" 2>/dev/null || printf '0')"
+    [[ "${cc}" -gt 0 ]] || break
+    if kibana_post_checked '/api/detection_engine/rules/_bulk_action' "{\"action\":\"enable\",\"ids\":${chunk}}" >/dev/null 2>&1; then
+      enabled_total=$((enabled_total + cc))
+    else
+      log "Bulk enable batch (offset ${offset}) did not succeed; continuing."
+    fi
+    offset=$((offset + 100))
+  done
+  log "Enabled ${enabled_total} of ${total} immutable prebuilt detection rules"
 }
 
 create_fleet_service_token() {
@@ -2361,7 +2404,7 @@ param(
 \$ScriptDir = Split-Path -Parent \$MyInvocation.MyCommand.Path
 \$Installer = Join-Path \$ScriptDir 'Enroll-ElasticAgent.ps1'
 if (-not (Test-Path \$Installer)) {
-    throw \"Expected Enroll-ElasticAgent.ps1 in \$ScriptDir\"
+    throw "Expected Enroll-ElasticAgent.ps1 in \$ScriptDir"
 }
 
 & \$Installer -FleetUrl '${FLEET_PUBLIC_URL}' -EnrollmentToken '${endpoint_enrollment_token}' -AgentVersion '${STACK_VERSION}' -Insecure:\$true -InstallSysmon:\$true -ForceReinstall:\$ForceReinstall -UninstallOnly:\$UninstallOnly
@@ -2721,11 +2764,11 @@ health_check() {
   fi
 
   echo "== Elasticsearch auth =="
-  curl -fsS -u "elastic:${ELASTIC_PASSWORD}" "${ES_URL_LOCAL}/_security/_authenticate?pretty" | jq '{username,roles}'
+  curl -fsS -u "elastic:${ELASTIC_PASSWORD}" "${ES_URL_LOCAL}/_security/_authenticate?pretty" | jq '{username,roles}' || echo "(Elasticsearch auth unavailable)"
   echo
 
   echo "== License =="
-  curl -fsS -u "elastic:${ELASTIC_PASSWORD}" "${ES_URL_LOCAL}/_license?pretty" | jq '.license | {type,status}'
+  curl -fsS -u "elastic:${ELASTIC_PASSWORD}" "${ES_URL_LOCAL}/_license?pretty" | jq '.license | {type,status}' || echo "(license unavailable)"
   echo
 
   echo "== Kibana status =="
@@ -2967,13 +3010,34 @@ print_hosted_enrollment_command() {
   esac
 }
 
+# Stage a directory holding only files that are safe to expose over the LAN
+# during enrollment. NEVER serve enrollment.env (elastic superuser password +
+# enrollment token) or fleet-server-install-example.sh (Fleet service token);
+# only the agent enrollment scripts/examples are needed by a target. Prints the
+# staged directory path.
+stage_enrollment_serve_dir() {
+  local serve_dir="${OUTPUT_DIR}/.serve"
+  rm -rf "${serve_dir}"
+  mkdir -p "${serve_dir}"
+  local f
+  for f in "${OUTPUT_DIR}"/*; do
+    [[ -f "${f}" ]] || continue
+    case "$(basename "${f}")" in
+      enrollment.env|fleet-server-install-example.sh|secrets.env) continue ;;
+    esac
+    cp "${f}" "${serve_dir}/"
+  done
+  printf '%s\n' "${serve_dir}"
+}
+
 serve_enrollment_files() {
   need_cmd python3
   ensure_enrollment_artifacts_for_target windows x86_64
-  local base_url bind_ip
+  local base_url bind_ip serve_dir
   base_url="$(resolve_enrollment_base_url)"
   bind_ip="${base_url#http://}"
   bind_ip="${bind_ip%:${ENROLLMENT_HTTP_PORT}}"
+  serve_dir="$(stage_enrollment_serve_dir)"
   cat <<EOFMSG
 Serving enrollment artifacts from:
   ${OUTPUT_DIR}
@@ -2986,7 +3050,7 @@ $(print_windows_download_commands "${base_url}")
 EOFMSG
 
   log "Starting HTTP server on ${base_url} (Ctrl+C to stop)"
-  exec python3 -m http.server "${ENROLLMENT_HTTP_PORT}" --bind "${bind_ip}" --directory "${OUTPUT_DIR}"
+  exec python3 -m http.server "${ENROLLMENT_HTTP_PORT}" --bind "${bind_ip}" --directory "${serve_dir}"
 }
 
 enroll_host() {
@@ -3004,17 +3068,18 @@ enroll_host() {
   arch="${arch:-x86_64}"
   ensure_enrollment_artifacts_for_target "${platform}" "${arch}"
 
-  local base_url bind_ip server_pid
+  local base_url bind_ip server_pid serve_dir
   base_url="$(resolve_enrollment_base_url)"
   bind_ip="${base_url#http://}"
   bind_ip="${bind_ip%:${ENROLLMENT_HTTP_PORT}}"
+  serve_dir="$(stage_enrollment_serve_dir)"
 
-  python3 -m http.server "${ENROLLMENT_HTTP_PORT}" --bind "${bind_ip}" --directory "${OUTPUT_DIR}" >/dev/null 2>&1 &
+  python3 -m http.server "${ENROLLMENT_HTTP_PORT}" --bind "${bind_ip}" --directory "${serve_dir}" >/dev/null 2>&1 &
   server_pid=$!
   sleep 1
   kill -0 "${server_pid}" >/dev/null 2>&1 || die "Failed to start HTTP server on ${base_url}"
 
-  trap 'kill "${server_pid}" >/dev/null 2>&1 || true; wait "${server_pid}" 2>/dev/null || true' EXIT
+  trap 'kill "${server_pid}" >/dev/null 2>&1 || true; wait "${server_pid}" 2>/dev/null || true; rm -rf "${serve_dir}" >/dev/null 2>&1 || true' EXIT
   cat <<EOFMSG
 Run this on the target:
 $(print_hosted_enrollment_command "${platform}" "${arch}" "${base_url}")
@@ -3026,6 +3091,7 @@ EOFMSG
   read -r _
   kill "${server_pid}" >/dev/null 2>&1 || true
   wait "${server_pid}" 2>/dev/null || true
+  rm -rf "${serve_dir}" >/dev/null 2>&1 || true
   trap - EXIT
 }
 

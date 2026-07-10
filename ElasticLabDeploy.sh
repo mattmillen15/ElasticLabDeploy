@@ -822,13 +822,17 @@ ensure_package_installed() {
   local status
   local resp
   local http_code
-  local query
+  local body
   local installed_ok=0
-  local -a query_variants=(
-    ""
-    "?ignoreUnverified=true"
-    "?force=true"
-    "?force=true&ignoreUnverified=true"
+  # Fleet moved 'force'/'ignore_constraints' from query params into the request
+  # BODY in 8.x+ — a query 'force' now 400s with "definition for this key is
+  # missing", so the old fallback never actually forced and a package needing
+  # force (e.g. after a prior partial install) could never install. Send force in
+  # the body; fall back to a plain body for older/stricter versions.
+  local -a body_variants=(
+    '{"force":true,"ignore_constraints":true}'
+    '{"force":true}'
+    '{}'
   )
 
   ver="$(get_latest_package_version "${pkg}")"
@@ -842,35 +846,36 @@ ensure_package_installed() {
   fi
 
   log "Installing/updating Fleet package '${pkg}' (${ver})"
-  for query in "${query_variants[@]}"; do
+  for body in "${body_variants[@]}"; do
     resp="$(curl -s -u "elastic:${ELASTIC_PASSWORD}" \
-      --connect-timeout 10 --max-time 180 \
+      --connect-timeout 10 --max-time 300 \
       -H 'kbn-xsrf: goad-edr-bootstrap' \
       -H 'Content-Type: application/json' \
       -H 'Accept: application/json' \
       -w '\n%{http_code}' \
-      -X POST "${KIBANA_URL}/api/fleet/epm/packages/${pkg}/${ver}${query}" \
-      -d '{}' 2>/dev/null || true)"
+      -X POST "${KIBANA_URL}/api/fleet/epm/packages/${pkg}/${ver}" \
+      -d "${body}" 2>/dev/null || true)"
     http_code="$(tail -n1 <<<"${resp}")"
     if [[ "${http_code}" == "200" || "${http_code}" == "201" || "${http_code}" == "204" ]]; then
       installed_ok=1
       break
     fi
 
-    # Some Fleet API versions reject specific query keys (force/ignoreUnverified).
-    if grep -q '\[request query.force\]: definition for this key is missing' <<<"${resp}" 2>/dev/null; then
-      continue
-    fi
-    if grep -q '\[request query.ignoreUnverified\]: definition for this key is missing' <<<"${resp}" 2>/dev/null; then
+    # Older/stricter Fleet versions reject body keys they don't know
+    # (force/ignore_constraints); drop them and retry with a simpler body.
+    if grep -q 'definition for this key is missing' <<<"${resp}" 2>/dev/null; then
       continue
     fi
 
+    # Some versions report the package installed even on a non-2xx POST.
     status="$(get_package_status "${pkg}" || true)"
     if [[ "${status}" == "installed" ]]; then
       log "Package '${pkg}' reports installed despite install response HTTP ${http_code}; continuing."
       installed_ok=1
       break
     fi
+
+    log "Package '${pkg}' install attempt failed (HTTP ${http_code}): $(printf '%s' "${resp%$'\n'*}" | tr '\n' ' ' | cut -c1-300)"
   done
 
   if [[ "${installed_ok}" -ne 1 ]]; then

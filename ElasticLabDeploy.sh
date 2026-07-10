@@ -31,9 +31,6 @@ ENABLE_PREBUILT_RULES="${ENABLE_PREBUILT_RULES:-true}"
 ENFORCE_ENDPOINT_HARDENING="${ENFORCE_ENDPOINT_HARDENING:-true}"
 ENABLE_OSQUERY_MANAGER="${ENABLE_OSQUERY_MANAGER:-true}"
 ENABLE_WINDOWS_INTEGRATION="${ENABLE_WINDOWS_INTEGRATION:-true}"
-ENABLE_THREAT_INTEL="${ENABLE_THREAT_INTEL:-true}"
-REQUIRE_THREAT_INTEL="${REQUIRE_THREAT_INTEL:-false}"
-THREAT_INTEL_PACKAGE_CANDIDATES="${THREAT_INTEL_PACKAGE_CANDIDATES:-ti_abusech,threat_intel,ti_otx,ti_opencti,ti_anomali,ti_misp}"
 REQUIRE_ADVANCED_PROTECTION="${REQUIRE_ADVANCED_PROTECTION:-true}"
 DISABLE_WINDOWS_LSASS_PROTECTION="${DISABLE_WINDOWS_LSASS_PROTECTION:-true}"
 
@@ -52,7 +49,6 @@ ENDPOINT_POLICY_NAME="${ENDPOINT_POLICY_NAME:-GOAD Windows EDR (Intense-like)}"
 ENDPOINT_INTEGRATION_NAME="${ENDPOINT_INTEGRATION_NAME:-Elastic Defend - GOAD EDRComplete}"
 OSQUERY_INTEGRATION_NAME="${OSQUERY_INTEGRATION_NAME:-Osquery Manager - GOAD}"
 WINDOWS_INTEGRATION_NAME="${WINDOWS_INTEGRATION_NAME:-Windows Telemetry - GOAD}"
-THREAT_INTEL_INTEGRATION_NAME_PREFIX="${THREAT_INTEL_INTEGRATION_NAME_PREFIX:-Threat Intel - GOAD}"
 ENROLLMENT_KEY_NAME="${ENROLLMENT_KEY_NAME:-goad-endpoint-enroll}"
 
 KIBANA_URL="http://127.0.0.1:${KIBANA_PORT}"
@@ -1164,68 +1160,6 @@ resolve_first_available_package_candidate() {
     fi
   done
   return 1
-}
-
-ensure_threat_intel_integration() {
-  local fleet_server_policy_id="$1"
-  if [[ "${ENABLE_THREAT_INTEL}" != "true" ]]; then
-    log "ENABLE_THREAT_INTEL=false; skipping threat intel integration"
-    return 0
-  fi
-
-  local package_name package_version raw candidate
-  local attempted_any=0
-  IFS=',' read -r -a raw <<<"${THREAT_INTEL_PACKAGE_CANDIDATES}"
-
-  if [[ "${#raw[@]}" -eq 0 ]]; then
-    if [[ "${REQUIRE_THREAT_INTEL}" == "true" ]]; then
-      die "No threat intel package candidates available (${THREAT_INTEL_PACKAGE_CANDIDATES})"
-    fi
-    log "No threat intel package candidates available; skipping."
-    return 0
-  fi
-
-  for candidate in "${raw[@]}"; do
-    package_name="${candidate//[[:space:]]/}"
-    [[ -n "${package_name}" ]] || continue
-    if ! get_package_info_json_safe "${package_name}" >/dev/null; then
-      continue
-    fi
-
-    attempted_any=1
-    # Threat intel is best-effort: a candidate that fails to install (e.g. an
-    # unsupported install query param on this Kibana version) must not abort the
-    # deploy via ensure_package_installed's die — fall through to the next candidate.
-    if ! package_version="$(ensure_package_installed "${package_name}")"; then
-      log "Threat intel package '${package_name}' failed to install; trying next candidate if available."
-      continue
-    fi
-
-    log "Ensuring threat intel integration (${package_name}) on Fleet Server policy"
-    if ensure_generic_integration_on_policy \
-        "${fleet_server_policy_id}" \
-        "${package_name}" \
-        "${package_version}" \
-        "${THREAT_INTEL_INTEGRATION_NAME_PREFIX} (${package_name})" \
-        "false"; then
-      return 0
-    fi
-
-    log "Threat intel integration candidate '${package_name}' failed; trying next candidate if available."
-  done
-
-  if [[ "${attempted_any}" -eq 0 ]]; then
-    if [[ "${REQUIRE_THREAT_INTEL}" == "true" ]]; then
-      die "No threat intel package candidates available (${THREAT_INTEL_PACKAGE_CANDIDATES})"
-    fi
-    log "No threat intel package candidates available; skipping."
-    return 0
-  fi
-
-  if [[ "${REQUIRE_THREAT_INTEL}" == "true" ]]; then
-    die "Threat intel integration is required but all candidate installs failed"
-  fi
-  log "Threat intel integration failed in non-required mode; continuing."
 }
 
 agent_policy_id_by_name() {
@@ -2537,7 +2471,6 @@ bootstrap_lab() {
   local fleet_service_token
   fleet_service_token="$(create_fleet_service_token)"
   ensure_fleet_server_runtime "${fleet_server_policy_id}" "${fleet_service_token}"
-  ensure_threat_intel_integration "${fleet_server_policy_id}"
 
   local endpoint_policy_id
   endpoint_policy_id="$(ensure_endpoint_agent_policy)"
@@ -2818,13 +2751,7 @@ health_check() {
         .package.name=="endpoint" or
         .package.name=="windows" or
         .package.name=="osquery_manager" or
-        .package.name=="fleet_server" or
-        .package.name=="ti_abusech" or
-        .package.name=="threat_intel" or
-        .package.name=="ti_otx" or
-        .package.name=="ti_opencti" or
-        .package.name=="ti_anomali" or
-        .package.name=="ti_misp"
+        .package.name=="fleet_server"
       )
     | [.package.name,.id,.name,.policy_id,.enabled]
     | @tsv

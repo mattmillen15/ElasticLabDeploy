@@ -429,6 +429,7 @@ kibana_post_raw() {
 kibana_post_checked() {
   local path="$1"
   local body="${2-}"
+  local quiet="${3:-false}"
   local resp http_code payload
   [[ -n "${body}" ]] || body='{}'
   resp="$(kibana_post_raw "${path}" "${body}")"
@@ -440,9 +441,13 @@ kibana_post_checked() {
     return 0
   fi
 
-  log "Kibana POST failed: path=${path} http=${http_code:-n/a}"
-  log "Kibana POST payload: $(jq -c . <<<"${body}" 2>/dev/null || printf '%s' "${body}")"
-  printf '%s\n' "${payload}" >&2
+  # quiet=true: expected probe (e.g. a version-dependent payload shape); the
+  # caller has a fallback, so don't alarm the log unless that fallback also fails.
+  if [[ "${quiet}" != "true" ]]; then
+    log "Kibana POST failed: path=${path} http=${http_code:-n/a}"
+    log "Kibana POST payload: $(jq -c . <<<"${body}" 2>/dev/null || printf '%s' "${body}")"
+    printf '%s\n' "${payload}" >&2
+  fi
   return 1
 }
 
@@ -1024,7 +1029,10 @@ ensure_generic_integration_on_policy() {
         version: $ver
       }
     }')"
-  if resp="$(kibana_post_checked '/api/fleet/package_policies' "${payload}")"; then
+  # Probe with a minimal payload (works on older Fleet, which auto-fills inputs).
+  # Newer Fleet (9.x) requires a full inputs array and rejects top-level 'enabled';
+  # that 400 is expected here, so keep it quiet and use the manifest payload below.
+  if resp="$(kibana_post_checked '/api/fleet/package_policies' "${payload}" "true")"; then
     local created_id
     created_id="$(jq -r '.item.id // empty' <<<"${resp}")"
     if [[ -n "${created_id}" ]]; then
@@ -1033,6 +1041,7 @@ ensure_generic_integration_on_policy() {
     fi
   fi
 
+  log "Integration '${package_name}': building full package-policy payload from manifest"
   package_info="$(get_package_info_json_safe "${package_name}" || true)"
   if [[ -n "${package_info}" ]]; then
     payload="$(build_generic_package_policy_payload_from_manifest "${package_info}" "${package_name}" "${package_version}" "${policy_id}" "${integration_name}")"

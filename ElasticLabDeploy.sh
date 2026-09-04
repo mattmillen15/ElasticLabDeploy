@@ -51,6 +51,9 @@ OSQUERY_INTEGRATION_NAME="${OSQUERY_INTEGRATION_NAME:-Osquery Manager - GOAD}"
 WINDOWS_INTEGRATION_NAME="${WINDOWS_INTEGRATION_NAME:-Windows Telemetry - GOAD}"
 ENROLLMENT_KEY_NAME="${ENROLLMENT_KEY_NAME:-goad-endpoint-enroll}"
 
+INSTANCE_LOCK="${INSTANCE_LOCK:-/run/lock/elasticlabdeploy.lock}"
+CURL_MAX_TIME="${CURL_MAX_TIME:-600}"
+
 KIBANA_URL="http://127.0.0.1:${KIBANA_PORT}"
 ES_URL_LOCAL="http://127.0.0.1:${ES_PORT}"
 LAST_ENDPOINT_PACKAGE_POLICY_ITEM=""
@@ -63,6 +66,10 @@ log() {
 die() {
   printf 'ERROR: %s\n' "$*" >&2
   exit 1
+}
+
+curl() {
+  command curl --connect-timeout 10 --max-time "${CURL_MAX_TIME}" "$@"
 }
 
 is_root() {
@@ -111,6 +118,38 @@ compose_cmd() {
     --env-file "${ENV_FILE}" \
     -f "${COMPOSE_FILE}" \
     "$@"
+}
+
+compose_down_all_projects() {
+  [[ -f "${COMPOSE_FILE}" && -f "${ENV_FILE}" ]] || return 0
+  local project
+  for project in "${COMPOSE_PROJECT}" "$(basename "${LAB_ROOT}")"; do
+    COMPOSE_PROJECT="${COMPOSE_PROJECT}" docker_compose_cmd \
+      -p "${project}" \
+      --env-file "${ENV_FILE}" \
+      -f "${COMPOSE_FILE}" \
+      down -v >/dev/null 2>&1 || true
+  done
+}
+
+remove_containers_by_image() {
+  local pattern="$1" name
+  while read -r name; do
+    [[ -n "${name}" ]] || continue
+    log "Removing conflicting container '${name}'"
+    docker rm -f "${name}" >/dev/null 2>&1 || true
+  done < <(docker ps -a --format '{{.Names}}\t{{.Image}}' 2>/dev/null \
+    | awk -F'\t' -v p="${pattern}" 'index($2, p) { print $1 }')
+}
+
+remove_stale_lab_containers() {
+  local name
+  for name in "${COMPOSE_PROJECT}_es01" "${COMPOSE_PROJECT}_kibana" "${FLEET_SERVER_CONTAINER}"; do
+    docker rm -f "${name}" >/dev/null 2>&1 || true
+  done
+  remove_containers_by_image docker.elastic.co/elasticsearch/elasticsearch
+  remove_containers_by_image docker.elastic.co/kibana/kibana
+  remove_containers_by_image docker.elastic.co/elastic-agent/elastic-agent
 }
 
 container_state() {
@@ -169,7 +208,7 @@ EOF
 }
 
 need_cmd() {
-  command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"
+  type -P "$1" >/dev/null 2>&1 || die "Missing required command: $1"
 }
 
 load_existing_secrets_if_present() {
@@ -220,6 +259,33 @@ start_docker_service_if_possible() {
   fi
 }
 
+apt_get() {
+  DEBIAN_FRONTEND=noninteractive apt-get -y \
+    -o Dpkg::Options::=--force-confdef \
+    -o Dpkg::Options::=--force-confold \
+    "$@" </dev/null
+}
+
+apt_missing_pkgs() {
+  local pkg
+  for pkg in "$@"; do
+    dpkg-query -W -f='${Status}' "${pkg}" 2>/dev/null | grep -qx 'install ok installed' \
+      || printf '%s\n' "${pkg}"
+  done
+}
+
+apt_lock_holder() {
+  local lock
+  command -v fuser >/dev/null 2>&1 || return 1
+  for lock in /var/lib/dpkg/lock-frontend /var/cache/apt/archives/lock; do
+    if [[ -e "${lock}" ]] && fuser "${lock}" >/dev/null 2>&1; then
+      printf '%s\n' "${lock}"
+      return 0
+    fi
+  done
+  return 1
+}
+
 install_first_available_pkg() {
   local manager="$1"
   shift
@@ -228,7 +294,9 @@ install_first_available_pkg() {
     [[ -n "${pkg}" ]] || continue
     case "${manager}" in
       apt)
-        if apt-get install -y "${pkg}" >/dev/null 2>&1; then
+        apt-cache show "${pkg}" >/dev/null 2>&1 || continue
+        log "Installing package '${pkg}'"
+        if apt_get install "${pkg}"; then
           log "Installed package '${pkg}'"
           return 0
         fi
@@ -264,10 +332,21 @@ install_host_prereqs() {
   fi
 
   if command -v apt-get >/dev/null 2>&1; then
-    export DEBIAN_FRONTEND=noninteractive
-    log "Installing host prerequisites with apt-get"
-    apt-get update -y >/dev/null
-    apt-get install -y ca-certificates curl jq openssl python3 tar lsof gawk sed coreutils >/dev/null
+    local -a missing=()
+    mapfile -t missing < <(apt_missing_pkgs ca-certificates curl jq openssl python3 tar lsof gawk sed coreutils)
+    if (( ${#missing[@]} > 0 )); then
+      local holder
+      if holder="$(apt_lock_holder)"; then
+        die "Another package manager is using ${holder}. Wait for it to finish, then re-run."
+      fi
+      log "Installing host prerequisites: ${missing[*]}"
+      log "apt also finishes any package setup left pending on this host, which can take several minutes. Progress follows."
+      apt_get update
+      apt_get install "${missing[@]}"
+      log "Host prerequisites installed"
+    else
+      log "Host prerequisites already installed"
+    fi
     if ! command -v docker >/dev/null 2>&1; then
       install_first_available_pkg apt docker.io docker-ce moby-engine || die "Unable to install Docker with apt-get"
     fi
@@ -718,7 +797,6 @@ fleet_api_setup() {
       return 0
     fi
 
-    # If Fleet APIs are already reachable, continue even if setup endpoint is noisy.
     if kibana_get '/api/fleet/agent_policies?perPage=1' >/dev/null 2>&1; then
       log "Fleet APIs are reachable; continuing."
       return 0
@@ -872,7 +950,6 @@ ensure_package_installed() {
       continue
     fi
 
-    # Some versions report the package installed even on a non-2xx POST.
     status="$(get_package_status "${pkg}" || true)"
     if [[ "${status}" == "installed" ]]; then
       log "Package '${pkg}' reports installed despite install response HTTP ${http_code}; continuing."
@@ -1286,7 +1363,6 @@ ensure_fleet_server_policy() {
     }')")
 
   if ! resp="$(create_agent_policy_with_variants "Fleet Server policy" "${payload_variants[@]}")"; then
-    # One more attempt to discover an auto-created default FS policy before failing.
     any_fs="$(fleet_server_policy_id_any || true)"
     if [[ -n "${any_fs}" ]]; then
       log "Discovered Fleet Server policy after create attempt (${any_fs})"
@@ -1456,7 +1532,6 @@ ensure_endpoint_defend_integration() {
     fi
   done
   if [[ "${created}" -ne 1 ]]; then
-    # Last chance: return existing package policy if one was created concurrently.
     existing="$(endpoint_package_policy_id_for_agent_policy "${policy_id}" || true)"
     if [[ -n "${existing}" ]]; then
       log "Endpoint integration discovered after create attempts (${existing})"
@@ -1805,8 +1880,9 @@ start_or_replace_fleet_server_container() {
 ensure_fleet_server_runtime() {
   local fleet_server_policy_id="$1"
   local fleet_service_token="$2"
+  local force="${3:-false}"
 
-  if fleet_server_is_healthy "${FLEET_PUBLIC_URL}"; then
+  if [[ "${force}" != "true" ]] && fleet_server_is_healthy "${FLEET_PUBLIC_URL}"; then
     log "Fleet Server already healthy at ${FLEET_PUBLIC_URL}; reusing existing deployment"
     return 0
   fi
@@ -2489,15 +2565,11 @@ bootstrap_lab() {
   resolve_public_urls
   load_or_create_secrets
 
-  # Full teardown: unenroll agents, stop fleet server, wipe volumes for a clean rebuild
   _try_unenroll_all_fleet_agents
-  log "Removing Fleet Server container and state volume"
-  docker rm -f "${FLEET_SERVER_CONTAINER}" >/dev/null 2>&1 || true
+  log "Stopping stack and wiping data volumes for clean rebuild"
+  compose_down_all_projects
+  remove_stale_lab_containers
   docker volume rm "${FLEET_SERVER_STATE_VOLUME}" >/dev/null 2>&1 || true
-  if [[ -f "${COMPOSE_FILE}" && -f "${ENV_FILE}" ]]; then
-    log "Stopping stack and wiping data volumes for clean rebuild"
-    compose_cmd down -v 2>/dev/null || true
-  fi
   TRIAL_ALREADY_ACTIVATED=""
 
   write_compose_files
@@ -2589,13 +2661,9 @@ EOFMSG
 }
 
 reset_lab() {
-  if [[ -f "${COMPOSE_FILE}" && -f "${ENV_FILE}" ]]; then
-    log "Stopping compose stack and removing volumes"
-    compose_cmd down -v || true
-  fi
-
-  log "Removing Fleet Server container and state volume"
-  docker rm -f "${FLEET_SERVER_CONTAINER}" >/dev/null 2>&1 || true
+  log "Stopping compose stack and removing volumes"
+  compose_down_all_projects
+  remove_stale_lab_containers
   docker volume rm "${FLEET_SERVER_STATE_VOLUME}" >/dev/null 2>&1 || true
 
   log "Removing runtime directory: ${LAB_ROOT}"
@@ -2747,12 +2815,13 @@ recover_fleet_server() {
   mkdir -p "${OUTPUT_DIR}"
   write_fleet_server_install_example "${fleet_server_policy_id}" "${fleet_service_token}"
   log "Removing existing Fleet Server container and state volume for forced re-enrollment"
-  docker rm -f "${FLEET_SERVER_CONTAINER}" >/dev/null 2>&1 || true
+  remove_containers_by_image docker.elastic.co/elastic-agent/elastic-agent
   docker volume rm "${FLEET_SERVER_STATE_VOLUME}" >/dev/null 2>&1 || true
-  ensure_fleet_server_runtime "${fleet_server_policy_id}" "${fleet_service_token}"
+  ensure_fleet_server_runtime "${fleet_server_policy_id}" "${fleet_service_token}" true
 }
 
 health_check() {
+  local CURL_MAX_TIME=15
   need_cmd curl
   need_cmd jq
   load_existing_secrets_if_present
@@ -3159,9 +3228,17 @@ dispatch_command() {
   esac
 }
 
+acquire_instance_lock() {
+  [[ -w "$(dirname "${INSTANCE_LOCK}")" ]] || return 0
+  exec 9>"${INSTANCE_LOCK}"
+  flock -n 9 \
+    || die "Another ElasticLabDeploy run is already active. Let it finish, or close it, before starting a new one."
+}
+
 main() {
   local cmd="${1:-menu}"
   maybe_self_elevate "${cmd}" "$@"
+  acquire_instance_lock
   dispatch_command "$@"
 }
 
